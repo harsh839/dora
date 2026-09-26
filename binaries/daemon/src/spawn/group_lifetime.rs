@@ -105,7 +105,12 @@ fn signal_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-#[cfg(all(test, unix))]
+// `#[cfg(test)]` on its own line, deliberately: `scripts/qa/unwrap-budget.sh`
+// excludes test blocks by that exact spelling, and a combined
+// `#[cfg(all(test, unix))]` is counted as production code — which is how this
+// module's test-only `.expect`s would land in the unwrap budget.
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
