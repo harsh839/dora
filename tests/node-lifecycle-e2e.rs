@@ -2555,6 +2555,74 @@ fn run_stop_does_not_orphan_term_ignoring_shell_nodes() {
     }
 }
 
+/// dora-rs/dora#3472 (review, 2026-09-26): a node that *dies on* the stop
+/// ladder's SIGTERM must not have its group asked to stop a second time.
+///
+/// The sibling test above pins a node that ignores SIGTERM; there the node
+/// outlives the signal, so the wait task is still running when the escalation
+/// lands and the group's single delivery is easy to explain. This is the
+/// opposite shape, and the only one that reaches the `signalled` bookkeeping in
+/// the wait task: the fixture shell has no SIGTERM handler, so the ladder's
+/// first group signal kills it, the node finishes on its own, and the daemon
+/// then contains whatever is left in the group — the child, which handles
+/// SIGTERM and counts. The group was already asked to stop by the `SoftKill`
+/// the wait task ran, so the containment must not deliver a second one; without
+/// that flag the child counts two and this test fails. Nothing in the daemon's
+/// unit tests reaches that wiring, since the flag is only ever set from inside
+/// the wait task.
+#[test]
+#[cfg(unix)]
+fn run_stop_signals_the_group_of_a_node_that_died_on_term_once() {
+    let _guard = LIFECYCLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // The child outlives the shell, so the group is still populated when the
+    // containment runs; the shell's own pid is published for teardown only.
+    let mut run = ShellOrphanRun::start_node_dying_on_term(Duration::from_secs(3));
+    let (_shell_pid, child_pid) = run.wait_for_shell_and_child();
+
+    // Same ladder as the sibling test: stop at 3s, SIGTERM at ~13s, SIGKILL at
+    // ~18s. The child ignores nothing but handles TERM, so it lives until that
+    // escalation and the CLI cannot exit before then.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match run.cli.try_wait().expect("try_wait failed") {
+            Some(status) => break status,
+            None => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "`dora run` did not exit within 60s; a node that dies on the \
+                     ladder's SIGTERM left its group outstanding (#3472)\n\
+                     stderr tail:\n{}",
+                    run.stderr_tail()
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    run.cli_reaped = true;
+
+    assert_eq!(
+        run.count_child_terms(),
+        1,
+        "the child must see exactly one SIGTERM: the `SoftKill` the wait task \
+         ran already asked the group to stop, and the containment must not ask \
+         again (#3472)\nstderr tail:\n{}",
+        run.stderr_tail()
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while process_alive(&child_pid.to_string()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child {child_pid} outlived a stopped `dora run` ({status}) by 30s: \
+             the group of a node that died on SIGTERM was not contained (#3472)\n\
+             stderr tail:\n{}",
+            run.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// dora-rs/dora#3472 (review, 2026-09-24): the exit-time `killpg` that contains
 /// a node's abandoned forks must NOT cut short the stop grace period.
 ///
@@ -2699,6 +2767,7 @@ struct ShellOrphanRun {
     shell_pid_file: std::path::PathBuf,
     child_pid_file: std::path::PathBuf,
     terms_file: std::path::PathBuf,
+    child_terms_file: std::path::PathBuf,
     files: Vec<std::path::PathBuf>,
 }
 
@@ -2714,16 +2783,39 @@ fn still_our_shell(pid: u32) -> bool {
     ps_args(pid).is_some_and(|args| args.contains(SHELL_FIXTURE_MARKER))
 }
 
+/// What the fixture's shell does with the stop ladder's SIGTERM.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum ShellStop {
+    /// Nothing installed, and a plain child: SIGTERM is fatal on its own.
+    Default,
+    /// Ignore the stop signals, and count the SIGTERM deliveries.
+    Ignore,
+    /// No handler, so the first SIGTERM ends the shell and with it the node,
+    /// while the child counts instead of dying.
+    DieOnTerm,
+}
+
 #[cfg(unix)]
 impl ShellOrphanRun {
     fn start() -> Self {
-        Self::start_with(None, false, false)
+        Self::start_with(None, ShellStop::Default, false)
     }
 
     /// A variant whose shell ignores SIGTERM/SIGINT/SIGHUP and which stops the
     /// `dora run` on its own via `--stop-after` (the normal stop path).
     fn start_term_ignoring(stop_after: Duration) -> Self {
-        Self::start_with(Some(stop_after), true, false)
+        Self::start_with(Some(stop_after), ShellStop::Ignore, false)
+    }
+
+    /// A variant whose shell has no `SIGTERM` handler, so the stop ladder's
+    /// first signal ends the *node* while its background child handles `SIGTERM`
+    /// and counts the deliveries. The group is therefore signalled once and the
+    /// node then exits on its own — the case where the daemon's containment has
+    /// to know the group was already asked to stop, and must not ask again
+    /// (#3472 review).
+    fn start_node_dying_on_term(stop_after: Duration) -> Self {
+        Self::start_with(Some(stop_after), ShellStop::DieOnTerm, false)
     }
 
     /// A variant whose shell backgrounds a child and RETURNS IMMEDIATELY
@@ -2731,14 +2823,10 @@ impl ShellOrphanRun {
     /// finishes, and the only thing left containing the fork is the daemon's
     /// exit-time `killpg` of the node's process group (`prepared.rs`).
     fn start_abandoned_fork() -> Self {
-        Self::start_with(None, false, true)
+        Self::start_with(None, ShellStop::Default, true)
     }
 
-    fn start_with(
-        stop_after: Option<Duration>,
-        ignore_term_signals: bool,
-        abandon_fork: bool,
-    ) -> Self {
+    fn start_with(stop_after: Option<Duration>, shell_stop: ShellStop, abandon_fork: bool) -> Self {
         use std::os::unix::process::CommandExt as _;
 
         ensure_cli_built();
@@ -2761,42 +2849,59 @@ impl ShellOrphanRun {
         }
         let scratch =
             |ext: &str| target.join(format!("dora-3472-shell-{}.{ext}", std::process::id()));
-        let (yaml, shell_pid_file, child_pid_file, terms_file, log) = (
+        let (yaml, shell_pid_file, child_pid_file, terms_file, child_terms_file, log) = (
             scratch("yml"),
             scratch("shell.pid"),
             scratch("child.pid"),
             scratch("terms.txt"),
+            scratch("child-terms.txt"),
             scratch("log"),
         );
 
         // The keep-alive fixture forks a background `sleep` and then `wait`s so
         // it stays up, and the shell pid is published for teardown. The
         // abandoned-fork fixture skips both: shell pid and `wait` are absent,
-        // so the shell exits the moment the fork is handed off. In the stop
-        // variant the shell additionally ignores the stop signals, so only the
-        // daemon's SIGKILL escalation can end it; a `TERM` trap there counts
-        // SIGTERM deliveries, so the test can pin the stop ladder to a single
-        // one. Paths are single-quoted so spaces in `$CARGO_TARGET_DIR` cannot
-        // break out of the redirect (mirroring `write_shell_dataflow`).
-        let ignore = if ignore_term_signals && !abandon_fork {
-            format!(
-                "trap '' INT HUP; trap 'echo t >> '{}'' TERM; ",
-                terms_file.display(),
-            )
-        } else {
+        // so the shell exits the moment the fork is handed off. In the
+        // `Ignore` variant the shell additionally ignores the stop signals, so
+        // only the daemon's SIGKILL escalation can end it; a `TERM` trap there
+        // counts SIGTERM deliveries, so the test can pin the stop ladder to a
+        // single one. `DieOnTerm` installs the other half of that trap on the
+        // child instead — the shell keeps SIGTERM's default action and so
+        // disappears on the ladder's first signal, ending the node, while the
+        // child lives on and counts. Paths are single-quoted so spaces in
+        // `$CARGO_TARGET_DIR` cannot break out of the redirect (mirroring
+        // `write_shell_dataflow`).
+        let ignore = if abandon_fork {
             String::new()
-        };
-        // In the stop variant the background child also ignores SIGTERM — the
-        // fixture shell already does — so the daemon's group-SIGKILL escalation
-        // is the only thing that can end either, and the test genuinely
-        // exercises the escalation instead of passing on the group SIGTERM
-        // alone (#3472 review P2). `trap '' TERM` runs in a subshell so only
-        // this process stops ignoring it, and SIG_IGN survives the `exec`,
-        // reaching the sleep itself. The other variants keep a plain child.
-        let child = if ignore_term_signals {
-            format!("(trap '' TERM; exec sleep {SHELL_FIXTURE_MARKER})")
         } else {
-            format!("sleep {SHELL_FIXTURE_MARKER}")
+            match shell_stop {
+                ShellStop::Default => String::new(),
+                ShellStop::Ignore => format!(
+                    "trap '' INT HUP; trap 'echo t >> '{}'' TERM; ",
+                    terms_file.display(),
+                ),
+                ShellStop::DieOnTerm => "trap '' INT HUP; ".to_string(),
+            }
+        };
+        // In the `Ignore` variant the background child also ignores SIGTERM —
+        // the fixture shell already does — so the daemon's group-SIGKILL
+        // escalation is the only thing that can end either, and the test
+        // genuinely exercises the escalation instead of passing on the group
+        // SIGTERM alone (#3472 review P2). `trap '' TERM` runs in a subshell so
+        // only this process stops ignoring it, and SIG_IGN survives the `exec`,
+        // reaching the sleep itself. The other variants keep a plain child, or —
+        // in `DieOnTerm` — a child whose `TERM` trap records every delivery and
+        // loops, so a second SIGTERM would be visible in the count. The `sleep`
+        // carries the fixture marker, so the child's cmdline still identifies it
+        // for teardown, and it is the sleep (not the subshell) that the signal
+        // kills: the trap then records the delivery and the loop sleeps again.
+        let child = match shell_stop {
+            ShellStop::Ignore => format!("(trap '' TERM; exec sleep {SHELL_FIXTURE_MARKER})"),
+            ShellStop::DieOnTerm => format!(
+                "(trap 'echo c >> '{}'' TERM; while :; do sleep {SHELL_FIXTURE_MARKER}; done)",
+                child_terms_file.display(),
+            ),
+            ShellStop::Default => format!("sleep {SHELL_FIXTURE_MARKER}"),
         };
         let shell_args = if abandon_fork {
             format!("{ignore}{child} & echo $! > '{}'", child_pid_file.display(),)
@@ -2836,7 +2941,15 @@ impl ShellOrphanRun {
             shell_pid_file: shell_pid_file.clone(),
             child_pid_file: child_pid_file.clone(),
             terms_file: terms_file.clone(),
-            files: vec![yaml, shell_pid_file, child_pid_file, terms_file, log],
+            child_terms_file: child_terms_file.clone(),
+            files: vec![
+                yaml,
+                shell_pid_file,
+                child_pid_file,
+                terms_file,
+                child_terms_file,
+                log,
+            ],
         }
     }
 
@@ -2850,6 +2963,16 @@ impl ShellOrphanRun {
     /// trap ever ran. `0` if the stop ladder never delivered SIGTERM at all.
     fn count_terms(&self) -> usize {
         fs::read_to_string(&self.terms_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// How many times the fixture's *background child* recorded receiving
+    /// SIGTERM. It handles the signal instead of dying, so this counts the
+    /// group-signals the stop ladder delivers: one from the ladder itself, and
+    /// a second one only if the daemon's containment asks again (#3472 review).
+    fn count_child_terms(&self) -> usize {
+        fs::read_to_string(&self.child_terms_file)
             .map(|s| s.lines().count())
             .unwrap_or(0)
     }

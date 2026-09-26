@@ -9,7 +9,6 @@
 /// The two instants a [`crate::ProcessOperation::StopRequested`] marks, so that
 /// a group whose leader has already exited can be given the same treatment it
 /// would have had if the leader were still there to receive it.
-#[cfg(unix)]
 pub(super) type StopLadder = (tokio::time::Instant, tokio::time::Instant);
 
 /// Contain what a node left behind in its process group, the moment the node

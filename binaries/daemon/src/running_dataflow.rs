@@ -823,22 +823,28 @@ impl RunningDataflow {
             }
             StopProcessPolicy::Graceful(duration) => {
                 let kill_duration = duration / 2;
+                // Mark the stop as in flight before the grace period starts: a
+                // node that exits because of the `NodeEvent::Stop` it just
+                // received leaves before any signal is due, and its children are
+                // then mid-shutdown rather than abandoned (#3472 review). Both
+                // deadlines travel with it so the node's process-wait task can
+                // put the group through this same ladder once the node process
+                // is gone, rather than cutting straight to the escalation — a
+                // node that stops promptly must not leave its children worse off
+                // than one that has to be chased (#3472 review).
+                //
+                // Submitted here and not from the task below: `stop_all` already
+                // sent `NodeEvent::Stop` to the node, so a node that exits on it
+                // can beat a marker queued by a spawned task, and its group
+                // would be killed at once instead of held. Nothing awaits
+                // between that send and this submit, so the marker is in the
+                // channel before the node can act on the event (#3472 review).
+                let soft_kill_at = tokio::time::Instant::now() + duration;
+                process.submit(ProcessOperation::StopRequested {
+                    soft_kill_at,
+                    kill_at: soft_kill_at + kill_duration,
+                });
                 tokio::spawn(async move {
-                    // Mark the stop as in flight before the grace period starts:
-                    // a node that exits because of the `NodeEvent::Stop` it just
-                    // received leaves before any signal is due, and its children
-                    // are then mid-shutdown rather than abandoned (#3472 review).
-                    // Both deadlines travel with it so the node's process-wait
-                    // task can put the group through this same ladder once the
-                    // node process is gone, rather than cutting straight to the
-                    // escalation — a node that stops promptly must not leave its
-                    // children worse off than one that has to be chased
-                    // (#3472 review).
-                    let soft_kill_at = tokio::time::Instant::now() + duration;
-                    process.submit(ProcessOperation::StopRequested {
-                        soft_kill_at,
-                        kill_at: soft_kill_at + kill_duration,
-                    });
                     tokio::time::sleep(duration).await;
                     if process.submit(ProcessOperation::SoftKill) {
                         grace_duration_kills.insert((node_id.clone(), generation));

@@ -214,6 +214,33 @@ pub struct PreparedNode {
     pub(super) ft_stats: Arc<crate::FaultToleranceStats>,
 }
 
+/// Take the stop marker left in a node's queue by the time it exits, which its
+/// wait task can no longer deliver: the task's `select!` breaks on whichever
+/// branch is ready and picks between two ready branches at random, so a marker
+/// queued in the same slot as the node's exit is left behind — and the ladder's
+/// later submits then go nowhere, because `op_rx` is dropped right after. Without
+/// the marker the containment would SIGKILL the group at once rather than hold it
+/// to the node's own ladder (#3472 review).
+///
+/// Only the marker is taken. Whatever the ladder queued behind it — a `SoftKill`
+/// or a `Kill` — is deliberately not run: the node process is already reaped, so
+/// signalling it risks hitting a recycled pid, and the marker's deadlines already
+/// tell the containment to deliver those same two signals to the whole group.
+fn take_queued_stop(
+    op_rx: &flume::Receiver<ProcessOperation>,
+    stop: &mut Option<super::group_lifetime::StopLadder>,
+) {
+    while let Ok(op) = op_rx.try_recv() {
+        if let ProcessOperation::StopRequested {
+            soft_kill_at,
+            kill_at,
+        } = op
+        {
+            stop.get_or_insert((soft_kill_at, kill_at));
+        }
+    }
+}
+
 impl PreparedNode {
     pub fn node_id(&self) -> &NodeId {
         &self.node.id
@@ -1033,6 +1060,14 @@ impl PreparedNode {
                 }
             };
 
+            // `select!` breaks on whichever branch is ready and picks between
+            // two ready branches at random, so the stop marker can still be
+            // sitting in the queue at this point. A stop is submitted
+            // synchronously when it is scheduled, so if one is coming it is
+            // already here; take it, or the group below is killed at once
+            // instead of held to this node's ladder (#3472 review).
+            take_queued_stop(&op_rx, &mut stop);
+
             // The node is gone, so nothing can be delivered to it. Drop the
             // receiver before waiting anything out: a held receiver would make the
             // ladder's later submits succeed, filing a "killed for not stopping"
@@ -1358,6 +1393,53 @@ struct RestartLoopReceivers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule `take_queued_stop` applies to a node that exits with its stop
+    /// marker still queued: the group it leaves behind must go through that
+    /// marker's own ladder, not be SIGKILLed at once (#3472 review).
+    #[test]
+    fn a_stop_marker_queued_behind_the_node_s_exit_is_still_taken() {
+        let (op_tx, op_rx) = flume::bounded(2);
+        let (soft_kill_at, kill_at) = (tokio::time::Instant::now(), tokio::time::Instant::now());
+        op_tx
+            .send(ProcessOperation::StopRequested {
+                soft_kill_at,
+                kill_at,
+            })
+            .expect("marker fits in an empty channel");
+
+        let mut stop = None;
+        take_queued_stop(&op_rx, &mut stop);
+        assert_eq!(
+            stop,
+            Some((soft_kill_at, kill_at)),
+            "a marker queued behind the node's exit must still put its group on \
+             the ladder it was scheduled with"
+        );
+
+        // Whatever the ladder queued behind the marker is left to the
+        // containment, which signals the group itself; the node process is
+        // reaped by now, so nothing here may signal it.
+        op_tx
+            .send(ProcessOperation::SoftKill)
+            .expect("the channel is still open");
+        take_queued_stop(&op_rx, &mut stop);
+        assert_eq!(
+            stop,
+            Some((soft_kill_at, kill_at)),
+            "the marker stays the group's ladder"
+        );
+    }
+
+    /// A node that was never asked to stop must not acquire a deadline from an
+    /// empty queue — that is what makes the containment kill its group at once.
+    #[test]
+    fn an_empty_operation_queue_leaves_the_stop_untouched() {
+        let (_op_tx, op_rx) = flume::bounded(2);
+        let mut stop = None;
+        take_queued_stop(&op_rx, &mut stop);
+        assert_eq!(stop, None);
+    }
 
     #[test]
     fn strip_trailing_newline_matches_lines_for_single_line() {
